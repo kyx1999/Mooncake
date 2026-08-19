@@ -1321,8 +1321,11 @@ TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     metadata.size = 128;
     metadata.replicas.push_back(replica.get_descriptor());
 
-    service.RestoreFromStandbySnapshot({{tenant_a.value(), key, metadata}},
-                                       /*initial_oplog_sequence_id=*/0, {});
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({{tenant_a.value(), key, metadata}},
+                                        /*initial_oplog_sequence_id=*/0, {})
+            .has_value());
 
     EXPECT_TRUE(service.ExistKey(key, tenant_a).value_or(false));
     EXPECT_FALSE(service.ExistKey(key, tenant_b).value_or(true));
@@ -2484,6 +2487,30 @@ TEST_F(MasterServiceTest, LocalFirstPutPrefersWriterHost) {
     config.host_id = "host1";
 
     auto put_start = service.PutStart(writer_client_id, "local_first_key",
+                                      TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
+}
+
+TEST_F(MasterServiceTest, PreferSameNodeUsesHostAwareLocalFirstPlacement) {
+    MasterService service;
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host1 = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.prefer_alloc_in_same_node = true;
+    config.host_id = "host1";
+
+    auto put_start = service.PutStart(writer_client_id, "prefer_same_node_key",
                                       TenantId::Default(), 1024, config);
     ASSERT_TRUE(put_start.has_value());
     ASSERT_EQ(put_start->size(), 1u);

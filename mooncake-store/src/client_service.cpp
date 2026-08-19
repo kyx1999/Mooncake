@@ -291,6 +291,22 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
            summary.allocated_dfs_replicas == config.dfs_replica_num;
 }
 
+std::optional<ErrorCode> ValidatePreferSameNodeWriteConfig(
+    const ReplicateConfig& config) {
+    if (config.nof_replica_num > 0) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                      "NoF replicas";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (config.replica_num != 1) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                      "replica_num != 1";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    return std::nullopt;
+}
+
 // success describes whether the overall put should succeed. Reliable modes
 // require all allocated replicas to complete. Flexible dual-replica mode only
 // requires one replica type to succeed, so success may be true while
@@ -2114,20 +2130,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    return BatchUpsert(keys, batched_slices, config, {});
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager) {
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
-    if (client_cfg.prefer_alloc_in_same_node) {
-        LOG(ERROR) << "prefer_alloc_in_same_node is not supported for upsert";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     ComputeBatchObjectChecksums(ops);
-    StartBatchUpsert(ops, client_cfg);
+    if (client_cfg.prefer_alloc_in_same_node) {
+        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(*err));
+        }
+        StartBatchUpsert(ops, client_cfg);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
+        return BatchWriteWhenPreferSameNode(ops, true);
+    }
 
+    StartBatchUpsert(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
     WaitForTransfers(ops);
@@ -3064,8 +3091,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     return results;
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
-    std::vector<PutOperation>& ops) {
+void Client::StageWriteBuffersForRemoteReplicas(
+    std::vector<PutOperation>& ops, const WriteBufferStager& stager) {
+    if (!stager) return;
+
+    for (auto& op : ops) {
+        if (op.IsResolved() || op.replicas.empty() ||
+            std::all_of(op.replicas.begin(), op.replicas.end(),
+                        [this](const Replica::Descriptor& replica) {
+                            return CanUseLocalMemcpy(replica);
+                        })) {
+            continue;
+        }
+        auto staged_slices = stager(op.slices);
+        if (!staged_slices) {
+            op.SetError(staged_slices.error(),
+                        "Failed to stage non-local write buffers");
+            continue;
+        }
+        op.slices = std::move(*staged_slices);
+        VLOG(1) << "Staged write buffers for non-local replica, key=" << op.key;
+    }
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
+    std::vector<PutOperation>& ops, bool is_upsert) {
     auto t0 = std::chrono::steady_clock::now();
     std::unordered_map<std::string, PutOperation> seg_to_ops{};
     for (auto& op : ops) {
@@ -3161,7 +3211,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
-    FinalizeBatchPut(ops);
+    if (is_upsert) {
+        FinalizeBatchUpsert(ops);
+    } else {
+        FinalizeBatchPut(ops);
+    }
     return CollectResults(ops);
 }
 
@@ -3169,6 +3223,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    return BatchPut(keys, batched_slices, config, {});
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager) {
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3176,22 +3237,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
-        if (client_cfg.nof_replica_num > 0) {
-            LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
-                          "NoF replicas";
+        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
             return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        if (client_cfg.replica_num != 1) {
-            LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
-                          "replica_num != 1";
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+                keys.size(), tl::unexpected(*err));
         }
         StartBatchPut(ops, client_cfg);
-        return BatchPutWhenPreferSameNode(ops);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
+        return BatchWriteWhenPreferSameNode(ops, false);
     }
     StartBatchPut(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
@@ -3897,14 +3952,33 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::vector<std::string>& targets) {
+    return Copy(key, tenant_id, source, targets, UUID{}, 0);
+}
+
+tl::expected<void, ErrorCode> Client::Copy(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const std::vector<std::string>& targets,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
     auto start_result =
-        master_client_.CopyStart(key, tenant_id, source, targets);
+        dynamic_replication_lease_id == UUID{}
+            ? master_client_.CopyStart(key, tenant_id, source, targets)
+            : master_client_.DynamicReplicaCopyStart(
+                  key, tenant_id, source, targets, dynamic_replication_lease_id,
+                  dynamic_replication_version_epoch);
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
+        if (dynamic_replication_lease_id != UUID{} &&
+            error == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            LOG(INFO) << "action=replica_copy_skipped"
+                      << ", key=" << key
+                      << ", info=target_replicas_already_exist";
+            return {};
+        }
         LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
                    << ", source=" << source << ", error=copy_start_failed"
                    << ", error_code=" << error;
@@ -3916,7 +3990,12 @@ tl::expected<void, ErrorCode> Client::Copy(
         LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
                   << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
-        auto copy_end_result = master_client_.CopyEnd(key, tenant_id);
+        auto copy_end_result =
+            dynamic_replication_lease_id == UUID{}
+                ? master_client_.CopyEnd(key, tenant_id)
+                : master_client_.DynamicReplicaCopyEnd(
+                      key, tenant_id, dynamic_replication_lease_id,
+                      dynamic_replication_version_epoch);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
             LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
@@ -3926,10 +4005,22 @@ tl::expected<void, ErrorCode> Client::Copy(
         return {};
     }
 
-    auto result = ExecuteReplicaTransfer(
-        key, "copy", [&]() { return master_client_.CopyEnd(key, tenant_id); },
-        [&]() { return master_client_.CopyRevoke(key, tenant_id); },
-        response.source, response.targets);
+    auto copy_end = [&]() {
+        return dynamic_replication_lease_id == UUID{}
+                   ? master_client_.CopyEnd(key, tenant_id)
+                   : master_client_.DynamicReplicaCopyEnd(
+                         key, tenant_id, dynamic_replication_lease_id,
+                         dynamic_replication_version_epoch);
+    };
+    auto copy_revoke = [&]() {
+        return dynamic_replication_lease_id == UUID{}
+                   ? master_client_.CopyRevoke(key, tenant_id)
+                   : master_client_.DynamicReplicaCopyRevoke(
+                         key, tenant_id, dynamic_replication_lease_id,
+                         dynamic_replication_version_epoch);
+    };
+    auto result = ExecuteReplicaTransfer(key, "copy", copy_end, copy_revoke,
+                                         response.source, response.targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -4508,8 +4599,13 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto copy_result = Copy(payload.key, payload.tenant_id,
-                                        payload.source, payload.targets);
+                const UUID dynamic_lease_id{
+                    payload.dynamic_replication_lease_id_high,
+                    payload.dynamic_replication_lease_id_low};
+                auto copy_result =
+                    Copy(payload.key, payload.tenant_id, payload.source,
+                         payload.targets, dynamic_lease_id,
+                         payload.dynamic_replication_version_epoch);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
